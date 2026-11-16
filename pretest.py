@@ -38,7 +38,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 UA = f"pretest/{VERSION} (authorized self-assessment)"
 CDN = None   # set when the target sits behind a proxy; port findings then describe the edge
 EXTRA_HEADERS: dict[str, str] = {}   # from --header, so authenticated areas can be probed
@@ -367,7 +367,11 @@ def _cipher(out):
 
 
 def tls_checks(host, port=443):
-    rc, pem, err = _openssl(["s_client", "-connect", f"{host}:{port}", "-servername", host, "-showcerts"], 25)
+    args = ["s_client", "-connect", f"{host}:{port}", "-servername", host, "-showcerts"]
+    rc, pem, err = _openssl(args, 25)
+    if "BEGIN CERTIFICATE" not in pem:
+        time.sleep(1.5)
+        rc, pem, err = _openssl(args, 25)   # a dropped connection must not become a CRITICAL finding
     if "BEGIN CERTIFICATE" not in pem:
         reason, line = _tls_reason(pem + "\n" + err)
         add("tls-handshake", "critical", "tls",
