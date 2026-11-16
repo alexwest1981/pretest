@@ -38,7 +38,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 UA = f"pretest/{VERSION} (authorized self-assessment)"
 CDN = None   # set when the target sits behind a proxy; port findings then describe the edge
 EXTRA_HEADERS: dict[str, str] = {}   # from --header, so authenticated areas can be probed
@@ -785,7 +785,11 @@ def self_test():
         def log_message(self, *a):
             pass
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Quiet(http.server.ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            pass    # the scanner closes early connections on purpose; the traceback is noise
+
+    srv = Quiet(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port = srv.server_address[1]
     try:
