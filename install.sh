@@ -7,9 +7,11 @@ base="https://github.com/alexwest1981/pretest/releases/latest/download"
 mkdir -p "$dest"
 
 curl -fsSL "$base/pretest.py" -o "$dest/pretest"
-curl -fsSL "$base/pretest.py.sha256" -o /tmp/pretest.sha256 2>/dev/null || true
-if [ -s /tmp/pretest.sha256 ]; then
-  ( cd "$dest" && sha256sum -c /tmp/pretest.sha256 ) || { echo "checksum mismatch, aborting" >&2; exit 1; }
+# the checksum file names pretest.py; the installed file has no .py — compare hashes directly
+if curl -fsSL "$base/pretest.py.sha256" -o /tmp/pretest.sha256 2>/dev/null && [ -s /tmp/pretest.sha256 ]; then
+  want=$(cut -d' ' -f1 < /tmp/pretest.sha256)
+  have=$(sha256sum "$dest/pretest" | cut -d' ' -f1)
+  [ "$want" = "$have" ] || { echo "checksum mismatch, aborting" >&2; exit 1; }
 fi
 chmod +x "$dest/pretest"
 echo "installed: $dest/pretest"
