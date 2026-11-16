@@ -38,7 +38,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 UA = f"pretest/{VERSION} (authorized self-assessment)"
 CDN = None   # set when the target sits behind a proxy; port findings then describe the edge
 EXTRA_HEADERS: dict[str, str] = {}   # from --header, so authenticated areas can be probed
@@ -275,14 +275,38 @@ PATHS = [
 ]
 
 
+PROBE_TIMEOUT = 8     # a healthy server answers a missing file in ms; a slow one may need seconds
+PROBE_BUDGET = 90     # wall-clock ceiling for the whole artefact sweep, however slow the host is
+
+
 def exposed(base, page, delay):
     bstatus, blen, bctype = page["baseline"]
+    fails = 0
+    seen = 0
+    deadline = time.time() + PROBE_BUDGET
     for path, sev, sig, title in PATHS:
+        if time.time() > deadline:
+            add("probe-budget", "info", "artifacts",
+                f"Tidsbudgeten tog slut efter {seen - 1} av {len(PATHS)} sökvägar",
+                f"{PROBE_BUDGET}s totalt · värden svarar långsamt",
+                "Resten är oprövade — inte rena.",
+                "Höj med --delay 0 eller kör om från en snabbare nätväg.")
+            return
+        seen += 1
         url = base.rstrip("/") + "/" + path
-        status, h, body = fetch(url)
+        status, h, body = fetch(url, timeout=PROBE_TIMEOUT)
         time.sleep(delay)
         if status is None:
+            fails += 1
+            if fails >= 3:
+                add("probe-aborted", "info", "artifacts",
+                    f"Avbröt sökvägsskanningen: värden svarar inte ({seen} av {len(PATHS)} försökta)",
+                    "tre anrop i rad nådde ingen server",
+                    "Resten av artefaktkontrollerna är oprövade — inte rena.",
+                    "Kör igen när värden svarar, eller kontrollera brandvägg/WAF.")
+                return
             continue
+        fails = 0
         text = _text(body)
         ctype = (H(h, "content-type") or "").lower()
         found = None
