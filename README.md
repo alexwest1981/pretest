@@ -17,23 +17,21 @@ agent, no account.
 No build step, no dependencies to install. Needs `python3` (3.10+) and `openssl`.
 
 ```bash
-# one-liner
+# one-liner (installs ~/.local/bin/pretest and verifies the checksum)
 curl -fsSL https://github.com/alexwest1981/pretest/releases/latest/download/install.sh | bash
 
-# or just take the single file
-curl -fsSL https://github.com/alexwest1981/pretest/releases/latest/download/pretest.py -o pretest
-chmod +x pretest
+# or take the single file, checked in place
+curl -fsSL https://github.com/alexwest1981/pretest/releases/latest/download/pretest.py -o pretest.py
+curl -fsSL https://github.com/alexwest1981/pretest/releases/latest/download/pretest.py.sha256 | sha256sum -c -
+chmod +x pretest.py
 
 # or from source
 git clone https://github.com/alexwest1981/pretest && cd pretest && ./pretest.py --self-test
 ```
 
-Verify the download if you care (a security tool you fetched and are about to run
-deserves it):
-
-```bash
-curl -fsSL https://github.com/alexwest1981/pretest/releases/latest/download/pretest.py.sha256 | sha256sum -c -
-```
+The checksum line verifies `pretest.py` in the current directory, so run it right
+after the download. Both paths need `sha256sum` (coreutils) — on macOS use
+`shasum -a 256 -c`.
 
 ## Run it against a system
 
@@ -103,7 +101,9 @@ Copy this list into your pentest scope as required test areas.
 
 ## Requirements and limits
 
-- **Linux and macOS** are what it is developed and tested on. Windows is untested.
+- Tested on **Linux** (Arch, Python 3.14, OpenSSL 3.6). **macOS** should work — both
+  `python3` (Xcode command line tools) and `openssl` ship with the system, and
+  `install.sh` falls back to `shasum` — but it is untested. **Windows** is not supported.
 - TLS checks shell out to `openssl s_client`. A modern OpenSSL build has TLS 1.0/1.1
   compiled out, in which case those versions are reported as *untested*, not as
   unsupported. Use `testssl.sh` when it matters.
