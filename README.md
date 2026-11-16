@@ -14,7 +14,7 @@ agent, no account.
 
 ## Install
 
-No build step, no dependencies to install. Needs `python3` (3.9+) and `openssl`.
+No build step, no dependencies to install. Needs `python3` (3.10+) and `openssl`.
 
 ```bash
 # one-liner

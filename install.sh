@@ -14,5 +14,5 @@ fi
 chmod +x "$dest/pretest"
 echo "installed: $dest/pretest"
 
-command -v python3 >/dev/null || { echo "warning: python3 (3.9+) is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "warning: python3 (3.10+) is required" >&2; exit 1; }
 case ":$PATH:" in *":$dest:"*) ;; *) echo "note: add $dest to PATH" ;; esac
