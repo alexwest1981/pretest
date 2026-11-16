@@ -38,7 +38,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 UA = f"pretest/{VERSION} (authorized self-assessment)"
 CDN = None   # set when the target sits behind a proxy; port findings then describe the edge
 EXTRA_HEADERS: dict[str, str] = {}   # from --header, so authenticated areas can be probed
@@ -336,6 +336,28 @@ def _openssl(args, timeout=20):
         return 1, "", repr(e)
 
 
+TLS_REASONS = [
+    (r"verify error:num=18|self-signed certificate", "certifikatet är självsignerat"),
+    (r"certificate has expired|verify error:num=10", "certifikatet har gått ut"),
+    (r"verify error:num=62|hostname mismatch|does not match", "certifikatet matchar inte värdnamnet"),
+    (r"verify error:num=2[01]|unable to get local issuer", "certifikatkedjan kan inte verifieras"),
+    (r"read 0 bytes", "servern stängde anslutningen under handskakningen"),
+    (r"alert handshake failure|sslv3 alert", "servern avvisade handskakningen med alert"),
+    (r"no protocols available", "lokal OpenSSL kan inte protokollet"),
+    (r"Connection refused", "anslutningen nekades"),
+    (r"wrong version number", "porten talar inte TLS"),
+]
+
+
+def _tls_reason(out):
+    """Human reason for a failed handshake, and the line it came from."""
+    for pat, msg in TLS_REASONS:
+        m = re.search(f"(?i).*({pat}).*", out)
+        if m:
+            return msg, m.group(0).strip()
+    return "", ""
+
+
 def _cipher(out):
     """Cipher from an s_client dump, or None ('Cipher is (NONE)' means it failed)."""
     m = re.search(r"Cipher(?: is |\s*:\s*)(\S+)", out)
@@ -345,10 +367,14 @@ def _cipher(out):
 
 
 def tls_checks(host, port=443):
-    _, pem, _ = _openssl(["s_client", "-connect", f"{host}:{port}", "-servername", host, "-showcerts"], 25)
+    rc, pem, err = _openssl(["s_client", "-connect", f"{host}:{port}", "-servername", host, "-showcerts"], 25)
     if "BEGIN CERTIFICATE" not in pem:
-        add("tls-handshake", "critical", "tls", "TLS-handskakning misslyckas", _clip(pem[-300:]),
-            fix="Kontrollera certifikat, SNI och protokollversion.")
+        reason, line = _tls_reason(pem + "\n" + err)
+        add("tls-handshake", "critical", "tls",
+            "TLS-handskakning misslyckas" + (f": {reason}" if reason else ""),
+            _clip(line or (pem + err)[-200:]),
+            "Ingen krypterad anslutning kan etableras — användaren möts av ett certifikatfel.",
+            "Kontrollera certifikat, SNI och protokollversion.")
         return
     # openssl x509 reads the PEM from stdin only via file, so go through a temp file
     leaf = pem[pem.index("-----BEGIN CERTIFICATE-----"):]
@@ -379,10 +405,12 @@ def tls_checks(host, port=443):
         except ValueError:
             pass
 
-    verify = re.search(r"Verify return code:\s*(\d+)", pem)
+    verify = re.search(r"Verify return code:\s*(\d+)(?:\s*\(([^)]*)\))?", pem)
     if verify and verify.group(1) != "0":
-        add("cert-untrusted", "high", "tls", "Certifikatet validerar inte",
-            _clip(pem[verify.start():verify.start() + 120]))
+        reason, _ = _tls_reason(pem)
+        add("cert-untrusted", "high", "tls",
+            "Certifikatet validerar inte" + (f": {reason}" if reason else ""),
+            _clip(verify.group(0).strip() + (f" · {verify.group(2)}" if verify.group(2) else "")))
 
     proto = re.search(r"Protocol\s*:\s*(\S+)", pem)
     cipher = _cipher(pem)
