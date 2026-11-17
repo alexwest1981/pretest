@@ -41,7 +41,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 UA = f"pretest/{VERSION} (authorized self-assessment)"
 CDN = None   # set when the target sits behind a proxy; port findings then describe the edge
 EXTRA_HEADERS: dict[str, str] = {}   # from --header, so authenticated areas can be probed
@@ -57,13 +57,21 @@ def add(fid, sev, area, title, evidence="", why="", fix=""):
     if fid in FINDINGS:
         return
     FINDINGS[fid] = {
-        "id": fid, "sev": sev, "area": area, "title": title,
-        "evidence": _clip(_redact(evidence)), "why": why, "fix": fix,
+        "id": fid, "sev": sev, "area": area,
+        "title": _redact(title),
+        "evidence": _clip(_redact(evidence)),
+        "why": _redact(why),
+        "fix": _redact(fix),
     }
 
 
 def _redact(text):
-    """One chokepoint: nothing that looks like a secret leaves the tool un-masked."""
+    """One chokepoint: every serialised field passes through here.
+
+    A secret no pattern recognises (an opaque token in an HTML comment) is still caught by the
+    last rule: any 20+ character run that contains a digit. Doc examples ("max-age=31536000",
+    "X-Permitted-Cross-Domain-Policies") contain no digits and survive.
+    """
     s = str(text)
     for _, _, pat in WEB_SECRETS:
         s = re.sub(pat, lambda m: _mask(m.group(0)), s)
@@ -73,6 +81,8 @@ def _redact(text):
     s = re.sub(r"(?i)\b(cookie|set-cookie)\s*:\s*\S+", r"\1: …", s)
     s = re.sub(r"\b([\w.-]+=)[^;\s]{12,}", r"\1…", s)      # long cookie/token values in a header dump
     s = re.sub(r"://[^/\s@]+@", "://…@", s)                  # https://user:pass@host
+    s = re.sub(r"\b(?=[A-Za-z0-9_+/=-]{20,}\b)(?=[A-Za-z0-9_+/=-]*\d)[A-Za-z0-9_+/=-]+",
+               lambda m: _mask(m.group(0)), s)
     return s
 
 
@@ -162,10 +172,17 @@ def http_checks(base, delay=0.2):
                     "301 till https:// på allt utom ACME-utmaningar; sätt HSTS efteråt.")
         else:
             reason, line = _tls_reason(_text(b2) if b2 else "")
-            if reason:
-                add("no-https", "critical", "transport", f"HTTPS fungerar inte: {reason}",
+            cert_reason = reason and re.search(r"certifikat|kedjan|värdnamn", reason)
+            if cert_reason:
+                add("https-cert-broken", "high", "tls",
+                    f"HTTPS går inte att använda: {reason}",
                     _clip(line or _text(b2)),
-                    fix="Kontrollera certifikat och TLS-terminering på rätt port.")
+                    "Besökaren möts av ett certifikatvarning och kan inte lita på anslutningen.",
+                    "Kontrollera certifikatet och att rätt kedja serveras på rätt port.")
+            elif reason:
+                add("no-https", "high", "transport", f"HTTPS fungerar inte: {reason}",
+                    _clip(line or _text(b2)),
+                    fix="Kontrollera TLS-termineringen på rätt port.")
             else:
                 add("https-unreachable", "info", "transport",
                     "HTTPS nåddes inte — orsaken är okänd", _clip(_text(b2) or "inget svar"),
@@ -451,12 +468,19 @@ def js_analysis(base, page):
     srcs = re.findall(r'<script[^>]+src="([^"]+\.js[^"]*)"', page["text"])
     inline = re.findall(r"<script[^>]*>(.{40,}?)</script>", page["text"], re.S)
     bodies = [("inline <script>", t) for t in inline[:3]]
+    missed = 0
     for src in srcs[:6]:
         url = urllib.parse.urljoin(page["url"], src)
-        status, _, body = fetch(url, timeout=PROBE_TIMEOUT)
+        status, _, body = fetch(url, timeout=PROBE_TIMEOUT, auth=False)
         if status == 200 and body:
             bodies.append((src, _text(body)))
+        else:
+            missed += 1
         time.sleep(0.1)
+    if missed:
+        add("js-partial", "info", "content",
+            f"{missed} skript kunde inte hämtas",
+            "resten av frontendkoden är oprövad — inte ren")
     if not bodies:
         add("js-none", "info", "content", "Inga skript att genomsöka",
             "0 externa <script src> och inga inline-block över 40 tecken",
@@ -561,7 +585,7 @@ def jwt_checks(page):
             continue
         alg = str(head.get("alg", "")).lower()
         if alg == "none":
-            add("jwt-alg-none", "high", "tokens",
+            add("jwt-alg-none", "medium", "tokens",
                 "JWT med alg=none i omlopp (serverns acceptans är inte prövad)",
                 f"header: {json.dumps(head)[:120]}",
                 "En osignerad token får aldrig godtas. Verktyget ser bara att en sådan token "
@@ -717,12 +741,21 @@ def cached_auth_response(page):
 
 
 ACTIVE_AUTH = False
+ACTIVE_AUTH_USER = None
 
 
 def active_auth(base, page):
     """Two requests, one fake user: does the login form say who exists?
     Gated behind --active-auth — a wrong guess can trigger a lockout on production."""
     if not ACTIVE_AUTH:
+        return
+    if not ACTIVE_AUTH_USER:
+        add("auth-user-missing", "info", "auth",
+            "Kontoenumerering är inte prövad",
+            "kräver --active-auth-user <ett testkonto du äger>",
+            "Proben skickar två felaktiga inloggningar och kan låsa kontot — därför pekar du "
+            "uttryckligen ut ett konto som får användas.",
+            "Kör med --active-auth --active-auth-user <testkonto>.")
         return
     m = re.search(r'<form[^>]*action=["\']([^"\']*)["\'][^>]*>(.*?)</form>', page["text"], re.S | re.I)
     if not m or 'type="password"' not in m.group(2).lower() and "type='password'" not in m.group(2).lower():
@@ -747,8 +780,8 @@ def active_auth(base, page):
     if fm:
         user_field = fm.group(1)
     results = {}
-    for label, user in (("okänd", f"pretest-nonexistent-{random.randint(100000,999999)}"),
-                        ("vanlig", "admin")):
+    for label, user in (("okänt konto", f"pretest-nonexistent-{random.randint(100000,999999)}"),
+                        ("testkontot", ACTIVE_AUTH_USER)):
         data = urllib.parse.urlencode({user_field: user, "password": "Pretest!Wrong1"}).encode()
         status, h, body = fetch(action, method="POST", data=data,
                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -758,7 +791,7 @@ def active_auth(base, page):
     if a[0] != b[0] or abs(a[1] - b[1]) > 40 or (a[2][:120] != b[2][:120]):
         add("user-enumeration", "medium", "auth",
             "Inloggningen svarar olika för okänt konto och känt konto",
-            f"okänt: {a[0]}/{a[1]}B · admin: {b[0]}/{b[1]}B",
+            f"okänt konto: {a[0]}/{a[1]}B · testkontot: {b[0]}/{b[1]}B",
             "Angriparen får en lista över vilka konton som finns innan lösenordsgissningen börjar.",
             "Samma svar, samma tid och samma text för alla fel — oavsett om kontot finns.")
 
@@ -965,7 +998,9 @@ def dns_checks(domain, delay=0.05):
         add("dkim-ok", "info", "email", "DKIM-selectorer hittade", ", ".join(dkim))
 
     caa = doh(domain, "CAA")
-    if caa == []:
+    if caa is None:
+        add("dns-unavailable-caa", "info", "dns", "CAA-uppslaget misslyckades — oprövat")
+    elif caa == []:
         add("no-caa", "low", "dns", "Ingen CAA-post",
             fix='CAA 0 issue "letsencrypt.org" — hindrar felaktig utfärdare.')
 
@@ -975,9 +1010,13 @@ def dns_checks(domain, delay=0.05):
             "Kunde inte hämta subdomäner från crt.sh — oprövat")
         return []
     if subs:
-        hits, takeovers = [], []
+        hits, takeovers, unverified = [], [], 0
         for name in subs[:120]:
-            cnames = [x["data"].rstrip(".") for x in (doh(name, "CNAME") or [])]
+            raw = doh(name, "CNAME")
+            if raw is None:
+                unverified += 1
+                continue
+            cnames = [x["data"].rstrip(".") for x in raw]
             if any(re.search(p, c.lower()) for c in cnames for p in TAKEOVER):
                 takeovers.append(f"{name} -> {cnames[0]}")
             if INTERESTING.search(name.split(".")[0]) and (cnames or doh(name, "A")):
@@ -988,6 +1027,10 @@ def dns_checks(domain, delay=0.05):
                 " · ".join(takeovers[:8]),
                 "Pekare mot molntjänst som kan vara oregistrerad — angriparen tar över namnet.",
                 "Verifiera varje pekare manuellt och ta bort de som inte används.")
+        if unverified:
+            add("dns-unavailable-subs", "info", "dns",
+                f"{unverified} subdomäner kunde inte verifieras",
+                "CNAME-uppslaget svarade inte — takeover-kontrollen är ofullständig där.")
         if hits:
             add("exposed-subdomains", "medium", "dns",
                 f"{len(hits)} icke-produktionssubdomäner svarar", ", ".join(hits[:12]),
@@ -1393,7 +1436,7 @@ def self_test():
         problems.append("oväntade medium eller värre: " + ", ".join(sorted(over)))
 
     # severities are part of the contract, not decoration
-    for fid, want in (("js-secrets", "critical"), ("jwt-alg-none", "high"),
+    for fid, want in (("js-secrets", "critical"), ("jwt-alg-none", "medium"),
                       ("xdomain-crossdomain.xml", "medium"), ("no-nosniff", "low")):
         if fid in FINDINGS and FINDINGS[fid]["sev"] != want:
             problems.append(f"{fid}: {FINDINGS[fid]['sev']} != {want}")
@@ -1504,8 +1547,41 @@ def self_test():
         problems.append("falska larm på en korrekt konfigurerad värd: "
                         + ", ".join(f"{i}({f['sev']})" for i, f in noisy.items()))
 
+    # the reviewers' own counter-proof: a secret in any field must not survive add()
+    FINDINGS.clear()
+    opaque = "pretest-opaque-secret-987654321"
+    add("redact-probe", "info", "x", "titel", evidence=opaque, why=opaque, fix=opaque)
+    leaked_fields = [k for k, v in FINDINGS["redact-probe"].items() if opaque in str(v)]
+    if leaked_fields:
+        problems.append("_redact lämnade en hemlighet i fälten: " + ", ".join(leaked_fields))
+
+    # the TLS path is otherwise untested: a self-signed host must be reported as such
+    import ssl as _ssl
+    import tempfile
+    tls_dir = tempfile.mkdtemp()
+    cert, key = os.path.join(tls_dir, "c.pem"), os.path.join(tls_dir, "k.pem")
+    try:
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-subj", "/CN=127.0.0.1", "-keyout", key, "-out", cert],
+                       capture_output=True, timeout=60)
+        tls_srv = Quiet(("127.0.0.1", 0), Handler)
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        tls_srv.socket = ctx.wrap_socket(tls_srv.socket, server_side=True)
+        threading.Thread(target=tls_srv.serve_forever, daemon=True).start()
+        FINDINGS.clear()
+        scan(f"https://127.0.0.1:{tls_srv.server_address[1]}", portscan=False, dns=False, delay=0)
+        tls_srv.shutdown()
+        got_tls = FINDINGS.get("cert-untrusted")
+        if not got_tls or got_tls["sev"] != "high":
+            problems.append("TLS-kontrollen fångade inte ett självsignerat certifikat")
+        if "tls-ok" not in FINDINGS and "tls-handshake" not in FINDINGS:
+            problems.append("TLS-kontrollen kördes inte alls (ingen tls-post)")
+    except Exception as exc:
+        problems.append(f"TLS-fixturen kunde inte köras: {exc!r}")
+
     print(f"self-test: {len(expect)} förväntade fynd, "
-          f"{len(noisy)} falska larm på ren fixture")
+          f"{len(noisy)} falska larm på ren fixture, TLS-kontroll prövad")
     if problems:
         for pr in problems:
             print("FEL:", pr)
@@ -1528,7 +1604,9 @@ def main(argv=None):
     ap.add_argument("-H", "--header", action="append", default=[], metavar="'Namn: värde'",
                     help="Extra header på varje anrop, t.ex. -H 'Cookie: session=…' för inloggat läge")
     ap.add_argument("--active-auth", action="store_true",
-                    help="Pröva inloggningsformuläret för kontoenumerering (2 POST:ar, kan låsa ett konto)")
+                    help="Pröva inloggningsformuläret för kontoenumerering (2 POST:ar)")
+    ap.add_argument("--active-auth-user", metavar="NAMN",
+                    help="Testkontot som proben får använda (krävs med --active-auth)")
     ap.add_argument("--fail-on", choices=list(SEV_ORDER), help="Exit 1 om fynd på denna nivå eller allvarligare")
     ap.add_argument("--self-test", action="store_true", help="Kör inbyggt test mot lokal fixtureserver")
     ap.add_argument("--version", action="version", version=f"pretest {VERSION}")
@@ -1540,8 +1618,9 @@ def main(argv=None):
             ap.error(f"--header måste vara 'Namn: värde', fick {raw!r}")
         EXTRA_HEADERS[name.strip()] = value.strip()
 
-    global ACTIVE_AUTH
+    global ACTIVE_AUTH, ACTIVE_AUTH_USER
     ACTIVE_AUTH = args.active_auth
+    ACTIVE_AUTH_USER = args.active_auth_user
 
     if args.self_test:
         return self_test()
