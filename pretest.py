@@ -23,6 +23,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -38,7 +41,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-VERSION = "1.0.6"
+VERSION = "1.1.0"
 UA = f"pretest/{VERSION} (authorized self-assessment)"
 CDN = None   # set when the target sits behind a proxy; port findings then describe the edge
 EXTRA_HEADERS: dict[str, str] = {}   # from --header, so authenticated areas can be probed
@@ -171,6 +174,12 @@ def http_checks(base, delay=0.2):
             fix="strict-origin-when-cross-origin.")
     if not H(h, "permissions-policy"):
         add("no-permissions-policy", "info", "headers", "Permissions-Policy saknas")
+    for hdr, fid, sev in (("cross-origin-opener-policy", "no-coop", "info"),
+                          ("cross-origin-resource-policy", "no-corp", "info"),
+                          ("x-permitted-cross-domain-policies", "no-xpcdp", "low")):
+        if not H(h, hdr):
+            add(fid, sev, "headers", f"{hdr} saknas",
+                fix="Sätt same-origin (COOP/CORP) och none (X-Permitted-Cross-Domain-Policies).")
 
     for hdr in ("server", "x-powered-by", "x-aspnet-version", "x-generator"):
         v = H(h, hdr)
@@ -235,6 +244,16 @@ def http_checks(base, delay=0.2):
 
     exposed(base, page, delay)
     sourcemaps(base, page)
+    content_audit(page)
+    js_analysis(base, page)
+    cloud_storage(page)
+    jwt_checks(page)
+    host_header(base)
+    error_pages(base)
+    methods_scan(base, page)
+    xdomain(base)
+    cached_auth_response(page)
+    active_auth(base, page)
     return page
 
 
@@ -349,7 +368,332 @@ def sourcemaps(base, page):
             return
 
 
+# ---------------------------------------------------------------- content, bundles, tokens
+
+def _mask(secret):
+    """Never put a live secret in a report or in a commit."""
+    s = str(secret)
+    return f"{s[:4]}…{s[-4:]} ({len(s)} tecken)" if len(s) > 12 else "…"
+
+
+WEB_SECRETS = [
+    ("aws-nyckel", "critical", r"AKIA[0-9A-Z]{16}"),
+    ("privat-nyckel", "critical", r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"),
+    ("stripe-live", "critical", r"sk_live_[0-9a-zA-Z]{16,}"),
+    ("github-token", "high", r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    ("slack-token", "high", r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    ("google-api-nyckel", "high", r"AIza[0-9A-Za-z_-]{35}"),
+    ("hemlighet-i-kod", "medium",
+     r"(?i)(?:api[_-]?key|secret|token|password|passwd)\s*[:=]\s*[\"'][^\"'\s]{12,}[\"']"),
+]
+INTERNAL_HOST = re.compile(r"https?://(?:localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+"
+                           r"|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|[\w.-]+\.(?:internal|local|lan)\b)")
+
+
+def _scan_secrets(text, source):
+    hits = []
+    for label, sev, pat in WEB_SECRETS:
+        for m in re.finditer(pat, text):
+            hits.append((label, sev, m.group(0), source))
+            if len(hits) >= 6:
+                return hits
+    return hits
+
+
+def js_analysis(base, page):
+    """The bundles a browser downloads are public source code. Read them."""
+    srcs = re.findall(r'<script[^>]+src="([^"]+\.js[^"]*)"', page["text"])
+    inline = re.findall(r"<script[^>]*>(.{40,}?)</script>", page["text"], re.S)
+    bodies = [("inline <script>", t) for t in inline[:3]]
+    for src in srcs[:6]:
+        url = urllib.parse.urljoin(page["url"], src)
+        status, _, body = fetch(url, timeout=PROBE_TIMEOUT)
+        if status == 200 and body:
+            bodies.append((src, _text(body)))
+        time.sleep(0.1)
+    if not bodies:
+        add("js-none", "info", "content", "Inga skript att genomsöka",
+            "0 externa <script src> och inga inline-block över 40 tecken",
+            "Hemligheter i frontendkoden är alltså oprövade — inte frånvarande.",
+            "Kör mot den sida som faktiskt laddar applikationens bundles.")
+        return
+
+    hits, internal = [], set()
+    for name, text in bodies:
+        hits += _scan_secrets(text, name)
+        for m in INTERNAL_HOST.finditer(text):
+            internal.add(m.group(0).rstrip('"\''))
+
+    if hits:
+        seen = set()
+        ev = []
+        for label, sev, value, src in hits:
+            key = (label, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            ev.append(f"{label} i {src}: {_mask(value)}")
+        worst = "critical" if any(h[1] == "critical" for h in hits) else (
+                "high" if any(h[1] == "high" for h in hits) else "medium")
+        add("js-secrets", worst, "content",
+            f"Hemligheter i publika JavaScript-filer ({len(seen)} st)", " · ".join(ev[:6]),
+            "Bundlarna är läsbara för vem som helst. Nycklar i dem används direkt av en angripare.",
+            "Flytta hemligheten till servern, rotera den, och lägg en kontroll i CI som stoppar nästa.")
+
+    for name, text in bodies:
+        todos = re.findall(r"(?:TODO|FIXME|HACK|XXX)[: ]([^\n*/]{6,80})", text)
+        if todos:
+            add("js-todo", "info", "content", f"Utvecklingsanteckningar i publika skript ({len(todos)})",
+                " · ".join(t.strip()[:60] for t in todos[:3]),
+                "Avslöjar interna vägar, namn och ibland lösenord som glömts kvar.",
+                "Strippa kommentarer i produktionsbygget.")
+
+    if internal:
+        add("js-internal-hosts", "medium", "content", "Interna värdnamn i publika skript",
+            ", ".join(sorted(internal)[:6]),
+            "Ger en angripare en karta till de system som inte ska vara nåbara utifrån.",
+            "Byt mot publika endpoints i produktionsbygget.")
+
+
+def cloud_storage(page):
+    """A bucket URL on the page is the page's claim about where data lives."""
+    found = set(re.findall(
+        r"https?://[\w.-]*(?:s3[.-][\w.-]*amazonaws\.com[\w/.-]*|storage\.googleapis\.com/[\w.-]+"
+        r"|blob\.core\.windows\.net/[\w$-]+|[\w.-]+\.s3\.amazonaws\.com[\w/.-]*)",
+        page["text"]))
+    if not found:
+        return
+    public, private = [], []
+    for url in list(found)[:4]:
+        status, _, body = fetch(url, timeout=PROBE_TIMEOUT)
+        time.sleep(0.15)
+        if status == 200 and b"<ListBucketResult" in body:
+            public.append(url)
+        elif status in (403, 401):
+            private.append(url)
+    if public:
+        add("cloud-bucket-public", "critical", "content", "Publik molnlagring (listning öppen)",
+            ", ".join(public[:4]),
+            "Allt i bucketen kan listas och laddas ner — ofta backuper, bilder och exportfiler.",
+            "Stäng publik listning och sätt bucket policy per objekt.")
+    elif private:
+        add("cloud-bucket-private", "info", "content", "Molnlagring refererad från sidan",
+            ", ".join(private[:4]) + " (403 — inte listbar, vilket är rätt)",
+            fix="Bekräfta att objektens egna ACL:er inte är öppna.")
+
+
+JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,}")
+WEAK_JWT_SECRETS = ["secret", "password", "changeme", "secretkey", "jwtsecret", "supersecret",
+                    "your-256-bit-secret", "test", "dev", "admin", "key", "1234", "s3cr3t"]
+
+
+def _b64json(seg):
+    seg += "=" * (-len(seg) % 4)
+    return json.loads(base64.urlsafe_b64decode(seg))
+
+
+def jwt_checks(page):
+    """A token handed to the browser is a claim about authority — read its header."""
+    tokens = set(JWT_RE.findall(page["text"]))
+    for value in EXTRA_HEADERS.values():
+        tokens |= set(JWT_RE.findall(value))
+    for c in (page["headers"].get_all("set-cookie") or []) if page["headers"] else []:
+        tokens |= set(JWT_RE.findall(c))
+    if not tokens:
+        return
+
+    for tok in list(tokens)[:3]:
+        parts = tok.split(".")
+        try:
+            head = _b64json(parts[0])
+            payload = _b64json(parts[1]) if len(parts) > 1 and parts[1] else {}
+        except Exception:
+            add("jwt-unparsed", "info", "tokens", "JWT hittad men kunde inte avkodas", _mask(tok))
+            continue
+        alg = str(head.get("alg", "")).lower()
+        if alg == "none":
+            add("jwt-alg-none", "critical", "tokens", "JWT accepterar alg=none",
+                f"header: {json.dumps(head)[:120]}",
+                "Signaturen stängs av och vem som helst kan skriva sin egen token.",
+                "Neka alg=none i verifieringen, med en allowlista av tillåtna algoritmer.")
+        if "exp" not in payload:
+            add("jwt-no-exp", "medium", "tokens", "JWT saknar utgångstid (exp)",
+                f"claims: {', '.join(sorted(payload)[:8])}",
+                "En stulen token gäller för evigt.",
+                "Sätt kort exp och förnya via refresh-token.")
+        if alg.startswith("hs") and len(parts) == 3:
+            signing_input = f"{parts[0]}.{parts[1]}".encode()
+            for secret in WEAK_JWT_SECRETS:
+                digest = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+                if base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == parts[2].rstrip("="):
+                    add("jwt-weak-secret", "critical", "tokens",
+                        "JWT signerad med en gissningsbar hemlighet",
+                        f"hemligheten är '{secret}' — token kan förfalskas av vem som helst",
+                        "Alla konton kan kapas genom att signera en egen token.",
+                        "Rotera hemligheten till 256 bitars slump och ogiltigför samtliga tokens.")
+                    break
+        kid = str(head.get("kid", ""))
+        if kid and re.search(r"[:/\\]|\.\.", kid):
+            add("jwt-kid-injection", "high", "tokens", "JWT kid innehåller sökvägstecken",
+                f"kid: {_clip(kid, 80)}",
+                "Om servern slår upp nyckeln via kid kan den pekas mot en fil angriparen styr.",
+                "Behandla kid som ett id i en allowlista, aldrig som en sökväg.")
+
+
+def content_audit(page):
+    text = page["text"]
+    comments = re.findall(r"<!--(.*?)-->", text, re.S)
+    interesting = [c.strip() for c in comments
+                   if re.search(r"(?i)todo|fixme|password|passwd|api[_-]?key|secret|internal|"
+                                r"debug|staging|dev\.|test\.|lösen", c)]
+    if interesting:
+        add("html-comments", "info", "content", "Kommentarer i HTML avslöjar intern information",
+            " · ".join(_clip(c, 90) for c in interesting[:3]),
+            "Ofta det snabbaste sättet att hitta interna system och glömda funktioner.",
+            "Strippa kommentarer i produktionsrenderingen.")
+
+    hidden = re.findall(r'<input[^>]+type=["\']hidden["\'][^>]*>', text, re.I)
+    risky = [h for h in hidden if re.search(r"(?i)admin|role|debug|token|price|amount|user_?id", h)]
+    if risky:
+        add("hidden-fields", "low", "content", "Känsliga fält skickas som hidden",
+            " · ".join(_clip(h, 90) for h in risky[:3]),
+            "Hidden-fält är klientstyrda: värdet kan ändras av användaren.",
+            "Verifiera auktoritet på servern, aldrig via ett dolt fält.")
+
+    blanks = re.findall(r'<a\b[^>]*target=["\']_blank["\'][^>]*>', text, re.I)
+    unsafe = [b for b in blanks if "noopener" not in b.lower() and "noreferrer" not in b.lower()]
+    if unsafe:
+        add("noopener-missing", "low", "content",
+            f"{len(unsafe)} länk(ar) med target=_blank saknar rel=noopener",
+            _clip(unsafe[0], 100),
+            "Den öppnade sidan får tillgång till window.opener och kan styra om fliken.",
+            'rel="noopener noreferrer" på varje target="_blank".')
+
+
+def host_header(base):
+    """Password-reset poisoning starts here: does the app believe a header?"""
+    probe = "pretest.invalid"
+    status, _, body = fetch(base.rstrip("/") + "/", headers={"X-Forwarded-Host": probe})
+    if status and probe in _text(body):
+        add("host-header-injection", "high", "content",
+            "X-Forwarded-Host ekar in i sidans innehåll",
+            f"X-Forwarded-Host: {probe} syntes i svaret",
+            "Byggs länkar eller återställningsadresser av headern kan angriparen styra dem.",
+            "Använd en fast konfigurerad bas-URL, eller en allowlista av värdnamn.")
+
+
+ERROR_MARKERS = [
+    (r"Traceback \(most recent call last\)", "Python-traceback"),
+    (r"at [\w.$]+\([\w.]+\.java:\d+\)", "Java-stacktrace"),
+    (r"(?i)stack trace:|#0\s+/", "PHP-stacktrace"),
+    (r"(?i)(Django|Werkzeug) (debug|Debug)", "Django/Werkzeug debug"),
+    (r"Whoops! There was an error", "Laravel Whoops"),
+    (r"SQLSTATE\[", "databasfel (SQLSTATE)"),
+    (r"(?i)you have an error in your sql syntax", "SQL-felmeddelande"),
+]
+
+
+def error_pages(base):
+    """Ask for something that cannot exist and read the apology."""
+    rnd = "".join(random.choices(string.ascii_lowercase, k=8))
+    for path in (f"pretest-err-{rnd}", f"pretest-err-{rnd}'\"<>", f"pretest-err-{rnd}%00"):
+        status, h, body = fetch(base.rstrip("/") + "/" + urllib.parse.quote(path, safe="%"),
+                                timeout=PROBE_TIMEOUT)
+        time.sleep(0.15)
+        if status is None:
+            continue
+        text = _text(body)
+        for pat, label in ERROR_MARKERS:
+            m = re.search(pat, text)
+            if m:
+                add(f"error-leak-{label.split()[0].lower()}", "medium", "errors",
+                    f"Felmeddelandet avslöjar teknik: {label}",
+                    _clip(text[max(0, m.start() - 60):m.start() + 140], 220),
+                    "Ger exakt ramverk, version och filväg — det som behövs för att välja exploit.",
+                    "Egen 404/500-sida utan detaljer; logga internt i stället.")
+
+
+def methods_scan(base, page):
+    """OPTIONS tells us what the server would accept on a path, without writing."""
+    for path in ("", f"pretest-methods-{random.randint(1000, 9999)}"):
+        url = base.rstrip("/") + "/" + path
+        status, h, _ = fetch(url, method="OPTIONS", timeout=PROBE_TIMEOUT)
+        time.sleep(0.15)
+        if not h:
+            continue
+        allow = (H(h, "allow") or "").upper()
+        write = [m for m in ("PUT", "DELETE", "PATCH") if m in allow]
+        if write:
+            add(f"methods-{path or 'root'}", "medium", "methods",
+                f"Skrivmetoder annonseras på {'/' if not path else 'okänd sökväg'}",
+                f"Allow: {allow}",
+                "Om metoderna faktiskt accepteras kan innehåll skapas eller raderas.",
+                "Stäng av metoder som applikationen inte använder (405 på resten).")
+
+
+def xdomain(base):
+    for path, marker in (("crossdomain.xml", r'<allow-access-from[^>]*domain=["\']\*["\']'),
+                         ("clientaccesspolicy.xml", r'<domain[^>]*uri=["\']\*["\']')):
+        status, _, body = fetch(base.rstrip("/") + "/" + path, timeout=PROBE_TIMEOUT)
+        time.sleep(0.1)
+        if status == 200 and re.search(marker, _text(body), re.I):
+            add(f"xdomain-{path}", "medium", "content",
+                f"{path} tillåter alla domäner",
+                _clip(_text(body), 160),
+                "Ger alla sajter åtkomst till innehållet via plugin/Flash-bryggor som fortfarande läses av äldre klienter.",
+                "Ta bort filen, eller begränsa till de domäner som faktiskt behöver den.")
+
+
+def cached_auth_response(page):
+    """An authenticated page that may be cached is one shared proxy from a leak."""
+    if not any(k.lower() in ("cookie", "authorization") for k in EXTRA_HEADERS):
+        return
+    cc = (H(page["headers"], "cache-control") or "").lower()
+    if "no-store" not in cc and "private" not in cc:
+        add("auth-cacheable", "medium", "cookies",
+            "Autentiserat svar saknar Cache-Control: no-store",
+            f"cache-control: {cc or '(saknas)'}",
+            "Delade cachar och historiken kan lämna ut inloggat innehåll till nästa användare.",
+            "Cache-Control: no-store på allt som kräver inloggning.")
+
+
+ACTIVE_AUTH = False
+
+
+def active_auth(base, page):
+    """Two requests, one fake user: does the login form say who exists?
+    Gated behind --active-auth — a wrong guess can trigger a lockout on production."""
+    if not ACTIVE_AUTH:
+        return
+    m = re.search(r'<form[^>]*action=["\']([^"\']*)["\'][^>]*>(.*?)</form>', page["text"], re.S | re.I)
+    if not m or 'type="password"' not in m.group(2).lower() and "type='password'" not in m.group(2).lower():
+        add("no-login-form", "info", "auth", "Inget inloggningsformulär hittades på startsidan",
+            fix="Kör med --url mot inloggningssidan om formuläret ligger någon annanstans.")
+        return
+    action = urllib.parse.urljoin(page["url"], m.group(1) or page["url"])
+    user_field = "username"
+    fm = re.search(r'<input[^>]*name=["\']([^"\']+)["\'][^>]*(?:type=["\'](?:text|email)["\'])', m.group(2), re.I)
+    if fm:
+        user_field = fm.group(1)
+    results = {}
+    for label, user in (("okänd", f"pretest-nonexistent-{random.randint(100000,999999)}"),
+                        ("vanlig", "admin")):
+        data = urllib.parse.urlencode({user_field: user, "password": "Pretest!Wrong1"}).encode()
+        status, h, body = fetch(action, method="POST", data=data,
+                                headers={"Content-Type": "application/x-www-form-urlencoded"})
+        results[label] = (status, len(body or b""), _text(body)[:400])
+        time.sleep(0.4)
+    a, b = results["okänd"], results["vanlig"]
+    if a[0] != b[0] or abs(a[1] - b[1]) > 40 or (a[2][:120] != b[2][:120]):
+        add("user-enumeration", "medium", "auth",
+            "Inloggningen svarar olika för okänt konto och känt konto",
+            f"okänt: {a[0]}/{a[1]}B · admin: {b[0]}/{b[1]}B",
+            "Angriparen får en lista över vilka konton som finns innan lösenordsgissningen börjar.",
+            "Samma svar, samma tid och samma text för alla fel — oavsett om kontot finns.")
+
+
 # ---------------------------------------------------------------- TLS
+
 
 def _openssl(args, timeout=20):
     """(rc, stdout, stderr) from openssl s_client/x509. Never raises."""
@@ -796,19 +1140,34 @@ def report(target, as_json=False):
 
 # ---------------------------------------------------------------- self-test
 
+def _fixture_jwt():
+    """Built at runtime: a literal that looks like a token gets redacted by editors and hooks."""
+    enc = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).rstrip(b"=").decode()
+    return enc({"alg": "none"}) + "." + enc({"sub": "1234567890"}) + "."
+
+
 def self_test():
     import http.server
     import threading
+
+    jwt = _fixture_jwt()
+    fake_aws = "AKIA" + "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             p = self.path.rstrip("/") or "/"
             if p in ("/", "/index.html"):
-                body = b"<html><body><script src=\"/app.js\"></script>hej</body></html>"
+                body = (b"<html><body><!-- internal: db01.corp.local -->"
+                        b"<script src=\"/app.js\"></script>"
+                        b"<form action=\"/login\" method=\"post\"><input type=\"text\" name=\"user\">"
+                        b"<input type=\"password\" name=\"password\"></form>"
+                        b"<input type=\"hidden\" name=\"is_admin\" value=\"0\">"
+                        b"<a href=\"/x\" target=\"_blank\">x</a>hej</body></html>")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Server", "TestSrv/0.9")
                 self.send_header("Set-Cookie", "sid=abc123; Path=/")
+                self.send_header("Set-Cookie", f"tok={jwt}; Path=/; HttpOnly")
             elif p == "/.env":
                 body = b"DB_PASSWORD=hunter2\nSECRET_KEY=abcdef\n"
                 self.send_response(200)
@@ -821,6 +1180,19 @@ def self_test():
                 body = b'{"version":3,"sources":["a.ts"]}'
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+            elif p == "/app.js":
+                body = (f'var k = "{fake_aws}";  // TODO rotate this before launch\n'
+                        'fetch("http://10.0.0.5/internal/api");\n').encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript")
+            elif p == "/crossdomain.xml":
+                body = b'<crossdomain-policy><allow-access-from domain="*"/></crossdomain-policy>'
+                self.send_response(200)
+                self.send_header("Content-Type", "text/x-cross-domain-policy")
+            elif "pretest-err" in p:
+                body = b"<html><h1>500</h1><pre>Traceback (most recent call last):</pre></html>"
+                self.send_response(500)
+                self.send_header("Content-Type", "text/html")
             else:
                 body = b"nope"
                 self.send_response(404)
@@ -834,7 +1206,7 @@ def self_test():
 
         def do_OPTIONS(self):
             self.send_response(200)
-            self.send_header("Allow", "GET, OPTIONS, TRACE")
+            self.send_header("Allow", "GET, OPTIONS, TRACE, PUT")
             self.send_header("Content-Length", "0")
             self.end_headers()
 
@@ -855,7 +1227,10 @@ def self_test():
 
     expect = {"no-https", "exposed-.env", "exposed-.git-config",
               "cors-reflect-credentials", "cookie-flags-sid", "sourcemaps-public",
-              "no-nosniff", "no-frame-protection", "trace-enabled"}
+              "no-nosniff", "no-frame-protection", "trace-enabled",
+              "js-secrets", "js-todo", "js-internal-hosts", "xdomain-crossdomain.xml",
+              "html-comments", "hidden-fields", "noopener-missing", "jwt-alg-none",
+              "jwt-no-exp", "methods-root", "error-leak-python-traceback"}
     got = set(FINDINGS)
     missing = expect - got
     print(f"self-test: {len(got)} fynd, {len(expect)} förväntade")
@@ -879,6 +1254,8 @@ def main(argv=None):
     ap.add_argument("--delay", type=float, default=0.2, help="Sekunder mellan HTTP-anrop (default 0.2)")
     ap.add_argument("-H", "--header", action="append", default=[], metavar="'Namn: värde'",
                     help="Extra header på varje anrop, t.ex. -H 'Cookie: session=…' för inloggat läge")
+    ap.add_argument("--active-auth", action="store_true",
+                    help="Pröva inloggningsformuläret för kontoenumerering (2 POST:ar, kan låsa ett konto)")
     ap.add_argument("--fail-on", choices=list(SEV_ORDER), help="Exit 1 om fynd på denna nivå eller allvarligare")
     ap.add_argument("--self-test", action="store_true", help="Kör inbyggt test mot lokal fixtureserver")
     ap.add_argument("--version", action="version", version=f"pretest {VERSION}")
@@ -889,6 +1266,9 @@ def main(argv=None):
         if not name.strip() or not value.strip():
             ap.error(f"--header måste vara 'Namn: värde', fick {raw!r}")
         EXTRA_HEADERS[name.strip()] = value.strip()
+
+    global ACTIVE_AUTH
+    ACTIVE_AUTH = args.active_auth
 
     if args.self_test:
         return self_test()
