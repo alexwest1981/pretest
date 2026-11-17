@@ -41,7 +41,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 UA = f"pretest/{VERSION} (authorized self-assessment)"
 CDN = None   # set when the target sits behind a proxy; port findings then describe the edge
 EXTRA_HEADERS: dict[str, str] = {}   # from --header, so authenticated areas can be probed
@@ -54,10 +54,11 @@ FINDINGS: dict[str, dict] = {}
 # ---------------------------------------------------------------- findings
 
 def add(fid, sev, area, title, evidence="", why="", fix=""):
+    fid = _redact(fid)          # the key is serialised too, so it masks like everything else
     if fid in FINDINGS:
         return
     FINDINGS[fid] = {
-        "id": fid, "sev": sev, "area": area,
+        "id": fid, "sev": sev, "area": _redact(area),
         "title": _redact(title),
         "evidence": _clip(_redact(evidence)),
         "why": _redact(why),
@@ -602,11 +603,13 @@ def jwt_checks(page):
             for secret in WEAK_JWT_SECRETS:
                 digest = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
                 if base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == parts[2].rstrip("="):
-                    add("jwt-weak-secret", "critical", "tokens",
-                        "JWT signerad med en gissningsbar hemlighet",
+                    add("jwt-weak-secret", "high", "tokens",
+                        "JWT signerad med en gissningsbar hemlighet "
+                        "(backendens acceptans är inte prövad)",
                         f"signaturen matchar en nyckel ur en kort gissningslista "
                         f"('{secret[0]}…{secret[-1]}', {len(secret)} tecken) — matematiskt verifierat",
-                        "Alla konton kan kapas genom att signera en egen token.",
+                        "Signaturen går att återskapa med en nyckel från en kort lista. Om backend "
+                        "accepterar en sådan token kan alla konton kapas — det prövar verktyget inte.",
                         "Rotera hemligheten till 256 bitars slump och ogiltigför samtliga tokens.")
                     break
         kid = str(head.get("kid", ""))
@@ -1019,7 +1022,11 @@ def dns_checks(domain, delay=0.05):
             cnames = [x["data"].rstrip(".") for x in raw]
             if any(re.search(p, c.lower()) for c in cnames for p in TAKEOVER):
                 takeovers.append(f"{name} -> {cnames[0]}")
-            if INTERESTING.search(name.split(".")[0]) and (cnames or doh(name, "A")):
+            a_rec = doh(name, "A")
+            if a_rec is None:
+                unverified += 1
+                continue
+            if INTERESTING.search(name.split(".")[0]) and (cnames or a_rec):
                 hits.append(name)
             time.sleep(delay)
         if takeovers:
@@ -1251,6 +1258,7 @@ inte dess omfattning av sig själv — punkterna ovan ska fortfarande beställas
 
 
 def report(target, as_json=False):
+    target = _redact(target)
     items = sorted(FINDINGS.values(), key=lambda f: (SEV_ORDER[f["sev"]], f["area"]))
     counts = {s: sum(1 for f in items if f["sev"] == s) for s in SEV_ORDER}
     if as_json:
@@ -1554,6 +1562,12 @@ def self_test():
     leaked_fields = [k for k, v in FINDINGS["redact-probe"].items() if opaque in str(v)]
     if leaked_fields:
         problems.append("_redact lämnade en hemlighet i fälten: " + ", ".join(leaked_fields))
+    add("bad-url?secret=" + opaque, "info", opaque, "t")
+    if opaque in json.dumps(FINDINGS, ensure_ascii=False, default=str):
+        problems.append("_redact lämnade en hemlighet i id/area")
+    if opaque in json.dumps(json.loads(report(f"https://u:{opaque}@127.0.0.1/", as_json=True)),
+                            ensure_ascii=False):
+        problems.append("_redact lämnade URL-userinfo i target")
 
     # the TLS path is otherwise untested: a self-signed host must be reported as such
     import ssl as _ssl
