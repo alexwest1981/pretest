@@ -41,7 +41,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 UA = f"pretest/{VERSION} (authorized self-assessment)"
 CDN = None   # set when the target sits behind a proxy; port findings then describe the edge
 EXTRA_HEADERS: dict[str, str] = {}   # from --header, so authenticated areas can be probed
@@ -102,10 +102,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _origin(url):
     """(scheme, host, port). Raises ValueError on a port outside 0-65535, which callers guard."""
     s = urllib.parse.urlsplit(url)
-    try:
-        port = s.port
-    except ValueError:
-        port = None
+    port = s.port          # raises ValueError outside 0-65535: never equate that with 443/80
     if port is None:
         port = 443 if s.scheme == "https" else 80
     return (s.scheme, (s.hostname or "").lower(), port)
@@ -115,7 +112,13 @@ def fetch(url, method="GET", headers=None, timeout=TIMEOUT, data=None, auth=True
     """Returns (status, headers|None, body bytes). Never raises."""
     req = urllib.request.Request(url, method=method, data=data)
     req.add_header("User-Agent", UA)
-    if auth and TARGET_ORIGIN and _origin(url) == TARGET_ORIGIN:
+    same_origin = False
+    if auth and TARGET_ORIGIN:
+        try:
+            same_origin = _origin(url) == TARGET_ORIGIN
+        except ValueError:
+            same_origin = False
+    if same_origin:
         for k, v in EXTRA_HEADERS.items():
             req.add_header(k, v)
     for k, v in (headers or {}).items():
@@ -144,6 +147,36 @@ def _text(body):
 
 # ---------------------------------------------------------------- transport
 
+def https_entry(host, http_status, http_url, http_headers, port=443):
+    """What the visitor meets on https://<host>/ when the site was reached over http."""
+    s2, _, b2 = fetch(f"https://{host}/" if port == 443 else f"https://{host}:{port}/")
+    if s2:
+        loc = H(http_headers, "location") or ""
+        if not (300 <= http_status < 400 and loc.startswith("https://")):
+            add("no-https-redirect", "high", "transport",
+                "HTTP svarar utan att skicka vidare till HTTPS",
+                f"GET {http_url} -> {http_status} {loc}",
+                "All trafik i klartext går att avlyssna och ändra.",
+                "301 till https:// på allt utom ACME-utmaningar; sätt HSTS efteråt.")
+        return
+    reason, line = _tls_reason(_text(b2) if b2 else "")
+    if reason and re.search(r"certifikat|kedjan|värdnamn", reason):
+        add("https-cert-broken", "high", "tls",
+            f"HTTPS går inte att använda: {reason}",
+            _clip(line or _text(b2)),
+            "Besökaren möts av en certifikatvarning och kan inte lita på anslutningen.",
+            "Kontrollera certifikatet och att rätt kedja serveras på rätt port.")
+    elif reason:
+        add("no-https", "high", "transport", f"HTTPS fungerar inte: {reason}",
+            _clip(line or _text(b2)),
+            fix="Kontrollera TLS-termineringen på rätt port.")
+    else:
+        add("https-unreachable", "info", "transport",
+            "HTTPS nåddes inte — orsaken är okänd", _clip(_text(b2) or "inget svar"),
+            "Kan vara brandvägg, port eller tillfälligt nätfel.",
+            "Verifiera TLS manuellt innan detta tolkas som saknad kryptering.")
+
+
 def http_checks(base, delay=0.2):
     url = base.rstrip("/") + "/"
     status, h, body = fetch(url)
@@ -159,36 +192,16 @@ def http_checks(base, delay=0.2):
     elif "cloudflare" in ((H(h, "server") or "").lower()):
         CDN = "Cloudflare"
 
-    # --- redirect http -> https
+    # --- redirect http -> https, only meaningful at the standard entry point
     if not https:
-        host = urllib.parse.urlsplit(url).netloc
-        s2, _, b2 = fetch(f"https://{host}/")
-        if s2:
-            loc = H(h, "location") or ""
-            if not (300 <= status < 400 and loc.startswith("https://")):
-                add("no-https-redirect", "high", "transport",
-                    "HTTP svarar utan att skicka vidare till HTTPS",
-                    f"GET {url} -> {status} {loc}", 
-                    "All trafik i klartext går att avlyssna och ändra.",
-                    "301 till https:// på allt utom ACME-utmaningar; sätt HSTS efteråt.")
+        port = (TARGET_ORIGIN or ("http", "", 80))[2]
+        if port != 80:
+            add("https-standard-port-unchecked", "info", "transport",
+                "HTTPS på standardporten är inte prövad",
+                f"målet ligger på port {port} — sajtens vanliga ingång kan vara en annan",
+                "Kör mot https://<värd>/ för att pröva det besökaren faktiskt möter.")
         else:
-            reason, line = _tls_reason(_text(b2) if b2 else "")
-            cert_reason = reason and re.search(r"certifikat|kedjan|värdnamn", reason)
-            if cert_reason:
-                add("https-cert-broken", "high", "tls",
-                    f"HTTPS går inte att använda: {reason}",
-                    _clip(line or _text(b2)),
-                    "Besökaren möts av ett certifikatvarning och kan inte lita på anslutningen.",
-                    "Kontrollera certifikatet och att rätt kedja serveras på rätt port.")
-            elif reason:
-                add("no-https", "high", "transport", f"HTTPS fungerar inte: {reason}",
-                    _clip(line or _text(b2)),
-                    fix="Kontrollera TLS-termineringen på rätt port.")
-            else:
-                add("https-unreachable", "info", "transport",
-                    "HTTPS nåddes inte — orsaken är okänd", _clip(_text(b2) or "inget svar"),
-                    "Kan vara brandvägg, port eller tillfälligt nätfel.",
-                    "Verifiera TLS manuellt innan detta tolkas som saknad kryptering.")
+            https_entry(urllib.parse.urlsplit(url).hostname or "", status, url, h)
 
     # --- HSTS
     if https:
@@ -482,6 +495,8 @@ def js_analysis(base, page):
         add("js-partial", "info", "content",
             f"{missed} skript kunde inte hämtas",
             "resten av frontendkoden är oprövad — inte ren")
+    if not bodies and missed:
+        return          # js-partial already reports the bundles as unproven
     if not bodies:
         add("js-none", "info", "content", "Inga skript att genomsöka",
             "0 externa <script src> och inga inline-block över 40 tecken",
@@ -1425,7 +1440,7 @@ def self_test():
     finally:
         srv.shutdown()
 
-    expect = {"no-https", "exposed-.env", "exposed-.git-config",
+    expect = {"https-standard-port-unchecked", "exposed-.env", "exposed-.git-config",
               "cors-reflect-credentials", "cookie-flags-sid", "sourcemaps-public",
               "no-nosniff", "no-frame-protection", "trace-enabled",
               "js-secrets", "js-todo", "js-internal-hosts", "xdomain-crossdomain.xml",
@@ -1445,7 +1460,8 @@ def self_test():
 
     # severities are part of the contract, not decoration
     for fid, want in (("js-secrets", "critical"), ("jwt-alg-none", "medium"),
-                      ("xdomain-crossdomain.xml", "medium"), ("no-nosniff", "low")):
+                      ("jwt-weak-secret", "high"), ("xdomain-crossdomain.xml", "medium"),
+                      ("no-nosniff", "low")):
         if fid in FINDINGS and FINDINGS[fid]["sev"] != want:
             problems.append(f"{fid}: {FINDINGS[fid]['sev']} != {want}")
 
@@ -1584,13 +1600,18 @@ def self_test():
         tls_srv.socket = ctx.wrap_socket(tls_srv.socket, server_side=True)
         threading.Thread(target=tls_srv.serve_forever, daemon=True).start()
         FINDINGS.clear()
-        scan(f"https://127.0.0.1:{tls_srv.server_address[1]}", portscan=False, dns=False, delay=0)
-        tls_srv.shutdown()
+        tls_port = tls_srv.server_address[1]
+        scan(f"https://127.0.0.1:{tls_port}", portscan=False, dns=False, delay=0)
         got_tls = FINDINGS.get("cert-untrusted")
         if not got_tls or got_tls["sev"] != "high":
             problems.append("TLS-kontrollen fångade inte ett självsignerat certifikat")
         if "tls-ok" not in FINDINGS and "tls-handshake" not in FINDINGS:
             problems.append("TLS-kontrollen kördes inte alls (ingen tls-post)")
+        FINDINGS.clear()          # the standard-port branch, exercised against the same cert
+        https_entry("127.0.0.1", 200, "http://127.0.0.1/", {}, port=tls_port)
+        if FINDINGS.get("https-cert-broken", {}).get("sev") != "high":
+            problems.append("https_entry skyllde inte ett trasigt certifikat på certifikatet")
+        tls_srv.shutdown()
     except Exception as exc:
         problems.append(f"TLS-fixturen kunde inte köras: {exc!r}")
 
@@ -1642,7 +1663,7 @@ def main(argv=None):
         ap.error("--url krävs (eller --self-test)")
 
     base = args.url if "://" in args.url else "https://" + args.url
-    print(f"# pretest {VERSION} mot {base} — endast mot system du äger eller har tillstånd att testa",
+    print(f"# pretest {VERSION} mot {_redact(base)} — endast mot system du äger eller har tillstånd att testa",
           file=sys.stderr)
     scan(base, args.domain, args.repo, not args.no_portscan, not args.no_dns, args.delay)
     print(report(base, as_json=False))
