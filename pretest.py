@@ -45,6 +45,7 @@ VERSION = "1.1.0"
 UA = f"pretest/{VERSION} (authorized self-assessment)"
 CDN = None   # set when the target sits behind a proxy; port findings then describe the edge
 EXTRA_HEADERS: dict[str, str] = {}   # from --header, so authenticated areas can be probed
+TARGET_ORIGIN = None   # scheme+host+port; credentials go here and nowhere else
 TIMEOUT = 12
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 FINDINGS: dict[str, dict] = {}
@@ -57,8 +58,21 @@ def add(fid, sev, area, title, evidence="", why="", fix=""):
         return
     FINDINGS[fid] = {
         "id": fid, "sev": sev, "area": area, "title": title,
-        "evidence": _clip(evidence), "why": why, "fix": fix,
+        "evidence": _clip(_redact(evidence)), "why": why, "fix": fix,
     }
+
+
+def _redact(text):
+    """One chokepoint: nothing that looks like a secret leaves the tool un-masked."""
+    s = str(text)
+    for _, _, pat in WEB_SECRETS:
+        s = re.sub(pat, lambda m: _mask(m.group(0)), s)
+    s = JWT_RE.sub(lambda m: _mask(m.group(0)), s)
+    s = re.sub(r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|APIKEY|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
+               r"(\s*[=:]\s*)\S+", r"\1\2…", s)
+    s = re.sub(r"(?i)\b(cookie|set-cookie)\s*:\s*\S+", r"\1: …", s)
+    s = re.sub(r"\b([\w.-]+=)[^;\s]{12,}", r"\1…", s)      # long cookie/token values in a header dump
+    return s
 
 
 def _clip(s, n=320):
@@ -73,11 +87,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def fetch(url, method="GET", headers=None, timeout=TIMEOUT, follow=False, data=None):
+def _origin(url):
+    s = urllib.parse.urlsplit(url)
+    return (s.scheme, (s.hostname or "").lower(), s.port or (443 if s.scheme == "https" else 80))
+
+
+def fetch(url, method="GET", headers=None, timeout=TIMEOUT, follow=False, data=None, auth=True):
     """Returns (status, headers|None, body bytes). Never raises."""
     req = urllib.request.Request(url, method=method, data=data)
     req.add_header("User-Agent", UA)
-    for k, v in {**EXTRA_HEADERS, **(headers or {})}.items():
+    if auth and TARGET_ORIGIN and _origin(url) == TARGET_ORIGIN:
+        for k, v in EXTRA_HEADERS.items():
+            req.add_header(k, v)
+    for k, v in (headers or {}).items():
         req.add_header(k, v)
     opener = urllib.request.build_opener() if follow else urllib.request.build_opener(_NoRedirect)
     try:
@@ -121,7 +143,7 @@ def http_checks(base, delay=0.2):
     # --- redirect http -> https
     if not https:
         host = urllib.parse.urlsplit(url).netloc
-        s2, _, _ = fetch(f"https://{host}/")
+        s2, _, b2 = fetch(f"https://{host}/")
         if s2:
             loc = H(h, "location") or ""
             if not (300 <= status < 400 and loc.startswith("https://")):
@@ -131,8 +153,16 @@ def http_checks(base, delay=0.2):
                     "All trafik i klartext går att avlyssna och ändra.",
                     "301 till https:// på allt utom ACME-utmaningar; sätt HSTS efteråt.")
         else:
-            add("no-https", "critical", "transport", "HTTPS fungerar inte alls",
-                f"https://{host}/ svarade inte", fix="Skaffa certifikat och terminera TLS.")
+            reason, line = _tls_reason(_text(b2) if b2 else "")
+            if reason:
+                add("no-https", "critical", "transport", f"HTTPS fungerar inte: {reason}",
+                    _clip(line or _text(b2)),
+                    fix="Kontrollera certifikat och TLS-terminering på rätt port.")
+            else:
+                add("https-unreachable", "info", "transport",
+                    "HTTPS nåddes inte — orsaken är okänd", _clip(_text(b2) or "inget svar"),
+                    "Kan vara brandvägg, port eller tillfälligt nätfel.",
+                    "Verifiera TLS manuellt innan detta tolkas som saknad kryptering.")
 
     # --- HSTS
     if https:
@@ -192,14 +222,15 @@ def http_checks(base, delay=0.2):
     # --- cookies
     raw_cookies = h.get_all("set-cookie") or [] if h else []
     for c in raw_cookies:
-        name = c.split("=", 1)[0].strip()
-        low = c.lower()
+        parts = [p.strip() for p in c.split(";")]
+        name = parts[0].split("=", 1)[0].strip()
+        attrs = {p.split("=", 1)[0].strip().lower() for p in parts[1:] if p}
         missing = []
-        if https and "secure" not in low:
+        if https and "secure" not in attrs:
             missing.append("Secure")
-        if "httponly" not in low:
+        if "httponly" not in attrs:
             missing.append("HttpOnly")
-        if "samesite" not in low:
+        if "samesite" not in attrs:
             missing.append("SameSite")
         if missing:
             add(f"cookie-flags-{name}", "medium", "cookies",
@@ -216,13 +247,14 @@ def http_checks(base, delay=0.2):
     if h2:
         acao = H(h2, "access-control-allow-origin") or ""
         acac = (H(h2, "access-control-allow-credentials") or "").lower() == "true"
-        if origin in acao and acac:
+        matched = [o.strip() for o in acao.split(",")] if acao else []
+        if origin in matched and acac:
             add("cors-reflect-credentials", "critical", "cors",
                 "CORS speglar godtyckligt Origin med credentials",
                 f"ACAO: {acao} / ACAC: true",
                 "Vilken sida som helst kan läsa inloggad användares data i webbläsaren.",
                 "Allowlista av exakta origins; aldrig spegla Origin när credentials tillåts.")
-        elif origin in acao:
+        elif origin in matched:
             add("cors-reflect", "medium", "cors", "CORS speglar godtyckligt Origin",
                 f"ACAO: {acao}", "Känsliga svar kan läsas av tredjepartssida.",
                 "Allowlista av exakta origins.")
@@ -250,7 +282,7 @@ def http_checks(base, delay=0.2):
     jwt_checks(page)
     host_header(base)
     error_pages(base)
-    methods_scan(base, page)
+    methods_scan(base)
     xdomain(base)
     cached_auth_response(page)
     active_auth(base, page)
@@ -299,7 +331,7 @@ PROBE_BUDGET = 90     # wall-clock ceiling for the whole artefact sweep, however
 
 
 def exposed(base, page, delay):
-    bstatus, blen, bctype = page["baseline"]
+    _, blen, _ = page["baseline"]
     fails = 0
     seen = 0
     deadline = time.time() + PROBE_BUDGET
@@ -512,10 +544,13 @@ def jwt_checks(page):
             continue
         alg = str(head.get("alg", "")).lower()
         if alg == "none":
-            add("jwt-alg-none", "critical", "tokens", "JWT accepterar alg=none",
+            add("jwt-alg-none", "high", "tokens",
+                "JWT med alg=none i omlopp (serverns acceptans är inte prövad)",
                 f"header: {json.dumps(head)[:120]}",
-                "Signaturen stängs av och vem som helst kan skriva sin egen token.",
-                "Neka alg=none i verifieringen, med en allowlista av tillåtna algoritmer.")
+                "En osignerad token får aldrig godtas. Verktyget ser bara att en sådan token "
+                "når klienten — om backend accepterar den måste prövas manuellt.",
+                "Neka alg=none i verifieringen med en allowlista av tillåtna algoritmer, "
+                "och verifiera sedan med ett eget anrop att en osignerad token avvisas.")
         if "exp" not in payload:
             add("jwt-no-exp", "medium", "tokens", "JWT saknar utgångstid (exp)",
                 f"claims: {', '.join(sorted(payload)[:8])}",
@@ -528,7 +563,7 @@ def jwt_checks(page):
                 if base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == parts[2].rstrip("="):
                     add("jwt-weak-secret", "critical", "tokens",
                         "JWT signerad med en gissningsbar hemlighet",
-                        f"hemligheten är '{secret}' — token kan förfalskas av vem som helst",
+                        f"signaturen matchar nyckeln '{secret}' (matematiskt verifierat)",
                         "Alla konton kan kapas genom att signera en egen token.",
                         "Rotera hemligheten till 256 bitars slump och ogiltigför samtliga tokens.")
                     break
@@ -597,11 +632,11 @@ def error_pages(base):
     """Ask for something that cannot exist and read the apology."""
     rnd = "".join(random.choices(string.ascii_lowercase, k=8))
     for path in (f"pretest-err-{rnd}", f"pretest-err-{rnd}'\"<>", f"pretest-err-{rnd}%00"):
-        status, h, body = fetch(base.rstrip("/") + "/" + urllib.parse.quote(path, safe="%"),
+        status, _, body = fetch(base.rstrip("/") + "/" + urllib.parse.quote(path, safe="%"),
                                 timeout=PROBE_TIMEOUT)
         time.sleep(0.15)
-        if status is None:
-            continue
+        if status is None or status < 400:
+            continue      # a 200 can quote a traceback in documentation without being a leak
         text = _text(body)
         for pat, label in ERROR_MARKERS:
             m = re.search(pat, text)
@@ -613,9 +648,9 @@ def error_pages(base):
                     "Egen 404/500-sida utan detaljer; logga internt i stället.")
 
 
-def methods_scan(base, page):
+def methods_scan(base):
     """OPTIONS tells us what the server would accept on a path, without writing."""
-    for path in ("", f"pretest-methods-{random.randint(1000, 9999)}"):
+    for path in ("",):
         url = base.rstrip("/") + "/" + path
         status, h, _ = fetch(url, method="OPTIONS", timeout=PROBE_TIMEOUT)
         time.sleep(0.15)
@@ -624,11 +659,12 @@ def methods_scan(base, page):
         allow = (H(h, "allow") or "").upper()
         write = [m for m in ("PUT", "DELETE", "PATCH") if m in allow]
         if write:
-            add(f"methods-{path or 'root'}", "medium", "methods",
+            add(f"methods-{path or 'root'}", "low", "methods",
                 f"Skrivmetoder annonseras på {'/' if not path else 'okänd sökväg'}",
-                f"Allow: {allow}",
-                "Om metoderna faktiskt accepteras kan innehåll skapas eller raderas.",
-                "Stäng av metoder som applikationen inte använder (405 på resten).")
+                f"Allow: {allow} (annonserat, inte prövat — verktyget skriver aldrig)",
+                "Är metoderna faktiskt aktiva och oskyddade kan innehåll ändras.",
+                "Stäng av de metoder applikationen inte använder (405 på resten), "
+                "och verifiera manuellt om de annonserade metoderna når data.")
 
 
 def xdomain(base):
@@ -648,6 +684,9 @@ def cached_auth_response(page):
     """An authenticated page that may be cached is one shared proxy from a leak."""
     if not any(k.lower() in ("cookie", "authorization") for k in EXTRA_HEADERS):
         return
+    _, _, anon = fetch(page["url"], auth=False)
+    if anon is not None and _text(anon)[:2000] == page["text"][:2000]:
+        return      # samma sida utan credentials = ingen inloggad vy som kan läcka
     cc = (H(page["headers"], "cache-control") or "").lower()
     if "no-store" not in cc and "private" not in cc:
         add("auth-cacheable", "medium", "cookies",
@@ -736,7 +775,7 @@ def _cipher(out):
 
 def tls_checks(host, port=443):
     args = ["s_client", "-connect", f"{host}:{port}", "-servername", host, "-showcerts"]
-    rc, pem, err = _openssl(args, 25)
+    _, pem, err = _openssl(args, 25)
     if "BEGIN CERTIFICATE" not in pem:
         time.sleep(1.5)
         rc, pem, err = _openssl(args, 25)   # a dropped connection must not become a CRITICAL finding
@@ -833,20 +872,31 @@ def doh(name, rtype, timeout=10):
            + urllib.parse.quote(name) + "&type=" + rtype)
     status, _, body = fetch(url, headers={"accept": "application/dns-json"}, timeout=timeout)
     if status != 200:
-        return []
+        return None      # None = kunde inte fråga; [] = frågade, fick inget svar
     try:
         return json.loads(body).get("Answer", [])
     except Exception:
-        return []
+        return None
 
 
 def dns_checks(domain, delay=0.05):
     if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", domain or ""):
         return
-    answers = doh(domain, "A") + doh(domain, "AAAA")
-    if not answers:
+    a, aaaa = doh(domain, "A"), doh(domain, "AAAA")
+    if a is None or aaaa is None:
+        add("dns-unavailable", "info", "dns", "DNS-kontrollerna kunde inte köras",
+            "DoH svarade inte (timeout eller blockerad anslutning)",
+            "E-post- och subdomänkontrollerna är oprövade — inte rena.",
+            "Kör om, eller använd --no-dns för att slippa externa uppslag.")
+        return
+    if not (a + aaaa):
         add("dns-no-a", "info", "dns", "Domänen svarar inte på A/AAAA via DoH", domain)
-    txts = [a["data"].strip('"') for a in doh(domain, "TXT")]
+    txt_raw = doh(domain, "TXT")
+    if txt_raw is None:
+        add("dns-unavailable-txt", "info", "email", "TXT-uppslaget misslyckades",
+            "SPF/DMARC/DKIM är oprövade — inte frånvarande.")
+        return
+    txts = [x["data"].strip('"') for x in txt_raw]
     spf = [t for t in txts if t.lower().startswith("v=spf1")]
     if not spf:
         add("no-spf", "medium", "email", "Ingen SPF-post",
@@ -859,9 +909,12 @@ def dns_checks(domain, delay=0.05):
     elif not spf[0].rstrip().endswith("-all"):
         add("soft-spf", "low", "email", "SPF slutar inte med -all", spf[0])
 
-    dmarc = [t for t in (a["data"].strip('"') for a in doh(f"_dmarc.{domain}", "TXT"))
+    dm_raw = doh(f"_dmarc.{domain}", "TXT")
+    dmarc = [t for t in (x["data"].strip('"') for x in (dm_raw or []))
              if t.lower().startswith("v=dmarc1")]
-    if not dmarc:
+    if dm_raw is None:
+        add("dns-unavailable-dmarc", "info", "email", "DMARC-uppslaget misslyckades — oprövat")
+    elif not dmarc:
         add("no-dmarc", "medium", "email", "Ingen DMARC-post",
             fix="v=DMARC1; p=quarantine; rua=mailto:dmarc@domän — börja med p=none och läs rapporterna.")
     elif re.search(r"(?i)p\s*=\s*none", dmarc[0]):
@@ -879,15 +932,20 @@ def dns_checks(domain, delay=0.05):
     else:
         add("dkim-ok", "info", "email", "DKIM-selectorer hittade", ", ".join(dkim))
 
-    if not doh(domain, "CAA"):
+    caa = doh(domain, "CAA")
+    if caa == []:
         add("no-caa", "low", "dns", "Ingen CAA-post",
             fix='CAA 0 issue "letsencrypt.org" — hindrar felaktig utfärdare.')
 
     subs = _crtsh(domain)
+    if subs is None:
+        add("dns-unavailable-crtsh", "info", "dns",
+            "Kunde inte hämta subdomäner från crt.sh — oprövat")
+        return []
     if subs:
         hits, takeovers = [], []
         for name in subs[:120]:
-            cnames = [a["data"].rstrip(".") for a in doh(name, "CNAME")]
+            cnames = [x["data"].rstrip(".") for x in (doh(name, "CNAME") or [])]
             if any(re.search(p, c.lower()) for c in cnames for p in TAKEOVER):
                 takeovers.append(f"{name} -> {cnames[0]}")
             if INTERESTING.search(name.split(".")[0]) and (cnames or doh(name, "A")):
@@ -909,11 +967,11 @@ def dns_checks(domain, delay=0.05):
 def _crtsh(domain):
     status, _, body = fetch(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=30)
     if status != 200:
-        return []
+        return None
     try:
         rows = json.loads(body)
     except Exception:
-        return []
+        return None
     names = set()
     for r in rows:
         for n in str(r.get("name_value", "")).split("\n"):
@@ -988,7 +1046,7 @@ def repo_checks(path):
     if not os.path.isdir(root):
         add("repo-missing", "info", "repo", "Repo-sökvägen finns inte", root)
         return
-    hits, seen, files = [], 0, 0
+    hits, seen, files = [], set(), 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for fn in filenames:
@@ -1061,7 +1119,6 @@ def sca(root):
             continue
         if r.returncode != 0:
             out = (r.stdout or "") + (r.stderr or "")
-            nums = re.search(r'"(critical|high|moderate|low)"\s*:\s*(\d+)', out)
             add(f"sca-{cmd[0]}", "high", "deps", f"Kända sårbarheter i beroenden ({cmd[0]})",
                 _clip(out.strip()[-300:]) if out.strip() else f"exit {r.returncode}",
                 "Pentestaren hittar dem inte (svart låda), men en angripare kan slå upp dem.",
@@ -1086,6 +1143,8 @@ def scan(base, domain=None, repo=None, portscan=True, dns=True, delay=0.2):
     if not host:
         add("bad-url", "info", "transport", "Ogiltig URL", base)
         return
+    global TARGET_ORIGIN
+    TARGET_ORIGIN = _origin(base)   # credentials never leave the target origin
     page = http_checks(base, delay)
     if dest.scheme == "https":
         tls_checks(host, dest.port or 443)
@@ -1107,8 +1166,9 @@ Vad verktyget INTE kan hitta (det du betalar en pentestare för):
   · Filuppladdning, deserialisering, mallinjicering
   · Kedjor: låg + låg = admin
   · Försvararsidan — loggas och larmas ett angrepp?
-Använd det här som underlag i scopet: skriv explicit att ovanstående ska testas,
-och bifoga den här rapporten så slipper de lägga tid på headers och /.env."""
+Bifoga rapporten i scopet som underlag: den visar vad som redan är kontrollerat och
+vad som uttryckligen är oprövat. Den ersätter inte ett penetrationstest och minskar
+inte dess omfattning av sig själv — punkterna ovan ska fortfarande beställas."""
 
 
 def report(target, as_json=False):
@@ -1167,7 +1227,7 @@ def self_test():
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Server", "TestSrv/0.9")
                 self.send_header("Set-Cookie", "sid=abc123; Path=/")
-                self.send_header("Set-Cookie", f"tok={jwt}; Path=/; HttpOnly")
+                self.send_header("Set-Cookie", f"tok={jwt}; Path=/; HttpOnly; SameSite=Lax")
             elif p == "/.env":
                 body = b"DB_PASSWORD=hunter2\nSECRET_KEY=abcdef\n"
                 self.send_response(200)
@@ -1213,6 +1273,43 @@ def self_test():
         def log_message(self, *a):
             pass
 
+    GOOD_HEADERS = (
+        ("Content-Type", "text/html"),
+        ("Strict-Transport-Security", "max-age=63072000; includeSubDomains"),
+        ("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "strict-origin-when-cross-origin"),
+        ("Permissions-Policy", "camera=(), microphone=()"),
+        ("Cross-Origin-Opener-Policy", "same-origin"),
+        ("Cross-Origin-Resource-Policy", "same-origin"),
+        ("X-Permitted-Cross-Domain-Policies", "none"),
+        ("Cache-Control", "no-store"),
+    )
+
+    class GoodHandler(http.server.BaseHTTPRequestHandler):
+        """En korrekt konfigurerad värd: får inte ge ett enda allvarligt fynd."""
+
+        def do_GET(self):
+            ok = self.path.rstrip("/") in ("", "/index.html")
+            self.send_response(200 if ok else 404)
+            for k, v in GOOD_HEADERS:
+                self.send_header(k, v)
+            if ok:
+                self.send_header("Set-Cookie", "sid=abc; Secure; HttpOnly; SameSite=Lax")
+            body = b"<html><body>ok</body></html>" if ok else b"nej"
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            self.send_response(200)
+            self.send_header("Allow", "GET, HEAD, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
     class Quiet(http.server.ThreadingHTTPServer):
         def handle_error(self, request, client_address):
             pass    # the scanner closes early connections on purpose; the traceback is noise
@@ -1231,11 +1328,84 @@ def self_test():
               "js-secrets", "js-todo", "js-internal-hosts", "xdomain-crossdomain.xml",
               "html-comments", "hidden-fields", "noopener-missing", "jwt-alg-none",
               "jwt-no-exp", "methods-root", "error-leak-python-traceback"}
+    problems = []
     got = set(FINDINGS)
     missing = expect - got
-    print(f"self-test: {len(got)} fynd, {len(expect)} förväntade")
     if missing:
-        print("SAKNAS:", ", ".join(sorted(missing)))
+        problems.append("saknas: " + ", ".join(sorted(missing)))
+
+    # an unexpected serious finding on the intentionally-bad fixture means over-reporting
+    over = {i for i in got - expect if SEV_ORDER[FINDINGS[i]["sev"]] <= SEV_ORDER["medium"]}
+    if over:
+        problems.append("oväntade medium eller värre: " + ", ".join(sorted(over)))
+
+    # severities are part of the contract, not decoration
+    for fid, want in (("js-secrets", "critical"), ("jwt-alg-none", "high"),
+                      ("xdomain-crossdomain.xml", "medium"), ("no-nosniff", "low")):
+        if fid in FINDINGS and FINDINGS[fid]["sev"] != want:
+            problems.append(f"{fid}: {FINDINGS[fid]['sev']} != {want}")
+
+    # no secret may survive into the report or the JSON
+    blob = json.dumps(FINDINGS, ensure_ascii=False)
+    for secret in (fake_aws, jwt):
+        if secret in blob:
+            problems.append(f"hemlighet läckte till rapporten ({len(secret)} tecken)")
+
+    # regression: credentials must never follow a link to another origin (annat port eller värd)
+    got_cookie = []
+
+    class Sink(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            got_cookie.append(self.headers.get("Cookie"))
+            body = b"var x=1;"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    global TARGET_ORIGIN, EXTRA_HEADERS
+    sink = Quiet(("127.0.0.1", 0), Sink)
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+    saved = (TARGET_ORIGIN, dict(EXTRA_HEADERS))
+    try:
+        TARGET_ORIGIN = ("http", "127.0.0.1", 9)      # ett annat origin än sinkens port
+        EXTRA_HEADERS.clear()
+        EXTRA_HEADERS["Cookie"] = "session=pretest-fixture-cookie-1234567890"
+        probe_page = {"url": "http://127.0.0.1:9/", "headers": None,
+                      "text": f'<html><script src="http://127.0.0.1:{sink.server_address[1]}/a.js">'
+                              f'</script></html>'}
+        js_analysis("http://127.0.0.1:9", probe_page)
+    finally:
+        TARGET_ORIGIN, EXTRA_HEADERS = saved
+        sink.shutdown()
+    if not got_cookie:
+        problems.append("credential-regressionen mätte inget (sinken nåddes inte)")
+    elif any(got_cookie):
+        problems.append("KREDENTIALER LÄCKTE TILL ETT ANNAT ORIGIN")
+
+    # a correctly configured host must produce nothing above low outside the http scheme itself
+    FINDINGS.clear()
+    good = Quiet(("127.0.0.1", 0), GoodHandler)
+    threading.Thread(target=good.serve_forever, daemon=True).start()
+    try:
+        scan(f"http://127.0.0.1:{good.server_address[1]}", portscan=False, dns=False, delay=0)
+    finally:
+        good.shutdown()
+    noisy = {i: f for i, f in FINDINGS.items()
+             if f["area"] != "transport" and SEV_ORDER[f["sev"]] <= SEV_ORDER["medium"]}
+    if noisy:
+        problems.append("falska larm på en korrekt konfigurerad värd: "
+                        + ", ".join(f"{i}({f['sev']})" for i, f in noisy.items()))
+
+    print(f"self-test: {len(expect)} förväntade fynd, "
+          f"{len(noisy)} falska larm på ren fixture")
+    if problems:
+        for pr in problems:
+            print("FEL:", pr)
         return 1
     print("OK")
     return 0
