@@ -72,6 +72,7 @@ def _redact(text):
                r"(\s*[=:]\s*)\S+", r"\1\2…", s)
     s = re.sub(r"(?i)\b(cookie|set-cookie)\s*:\s*\S+", r"\1: …", s)
     s = re.sub(r"\b([\w.-]+=)[^;\s]{12,}", r"\1…", s)      # long cookie/token values in a header dump
+    s = re.sub(r"://[^/\s@]+@", "://…@", s)                  # https://user:pass@host
     return s
 
 
@@ -88,11 +89,18 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _origin(url):
+    """(scheme, host, port). Raises ValueError on a port outside 0-65535, which callers guard."""
     s = urllib.parse.urlsplit(url)
-    return (s.scheme, (s.hostname or "").lower(), s.port or (443 if s.scheme == "https" else 80))
+    try:
+        port = s.port
+    except ValueError:
+        port = None
+    if port is None:
+        port = 443 if s.scheme == "https" else 80
+    return (s.scheme, (s.hostname or "").lower(), port)
 
 
-def fetch(url, method="GET", headers=None, timeout=TIMEOUT, follow=False, data=None, auth=True):
+def fetch(url, method="GET", headers=None, timeout=TIMEOUT, data=None, auth=True):
     """Returns (status, headers|None, body bytes). Never raises."""
     req = urllib.request.Request(url, method=method, data=data)
     req.add_header("User-Agent", UA)
@@ -101,7 +109,7 @@ def fetch(url, method="GET", headers=None, timeout=TIMEOUT, follow=False, data=N
             req.add_header(k, v)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
-    opener = urllib.request.build_opener() if follow else urllib.request.build_opener(_NoRedirect)
+    opener = urllib.request.build_opener(_NoRedirect)   # a redirect is data, never a place to follow
     try:
         with opener.open(req, timeout=timeout) as r:
             return r.status, r.headers, r.read(400_000)
@@ -233,9 +241,12 @@ def http_checks(base, delay=0.2):
         if "samesite" not in attrs:
             missing.append("SameSite")
         if missing:
-            add(f"cookie-flags-{name}", "medium", "cookies",
+            sessionish = bool(re.search(r"(?i)sess|sid|auth|token|jwt|login|user|remember", name))
+            add(f"cookie-flags-{name}", "medium" if sessionish else "low", "cookies",
                 f"Cookie '{name}' saknar {', '.join(missing)}", c,
-                "Stjäls via XSS (HttpOnly), skickas i klartext (Secure) eller i CSRF (SameSite).",
+                ("Ser ut som en sessionscookie: " if sessionish else "Ser inte ut som en sessionscookie, men: ")
+                + f"utan {', '.join(missing)} kan den läsas av skript, skickas i klartext "
+                  "eller följa med i en CSRF-förfrågan.",
                 f"Set-Cookie: {name}=…; Secure; HttpOnly; SameSite=Lax"
                 + ("; Prefixa med __Host- om cookien bara ska gälla värden." if https else ""))
         if https and name.startswith("__") and not name.startswith("__Host-") and not name.startswith("__Secure-"):
@@ -249,11 +260,14 @@ def http_checks(base, delay=0.2):
         acac = (H(h2, "access-control-allow-credentials") or "").lower() == "true"
         matched = [o.strip() for o in acao.split(",")] if acao else []
         if origin in matched and acac:
-            add("cors-reflect-credentials", "critical", "cors",
-                "CORS speglar godtyckligt Origin med credentials",
+            add("cors-reflect-credentials", "high", "cors",
+                "CORS speglar godtyckligt Origin med credentials (konfigurationsfel)",
                 f"ACAO: {acao} / ACAC: true",
-                "Vilken sida som helst kan läsa inloggad användares data i webbläsaren.",
-                "Allowlista av exakta origins; aldrig spegla Origin när credentials tillåts.")
+                "Konfigurationen tillåter vilken sajt som helst att läsa svar med credentials. "
+                "Om ett sådant svar innehåller användardata är det en direkt läcka — det prövar "
+                "verktyget inte.",
+                "Allowlista av exakta origins; aldrig spegla Origin när credentials tillåts. "
+                "Verifiera manuellt vilket känsligt svar som faktiskt returneras.")
         elif origin in matched:
             add("cors-reflect", "medium", "cors", "CORS speglar godtyckligt Origin",
                 f"ACAO: {acao}", "Känsliga svar kan läsas av tredjepartssida.",
@@ -394,7 +408,7 @@ def sourcemaps(base, page):
         url = urllib.parse.urljoin(page["url"], src)
         status, h, body = fetch(url + ".map", timeout=8)
         if status == 200 and body[:1] == b"{" and b'"sources"' in body[:5000]:
-            add("sourcemaps-public", "medium", "artifacts", "Källkodskartor (source maps) publika",
+            add("sourcemaps-public", "low", "artifacts", "Källkodskartor (source maps) publika",
                 f"{url}.map", "Ger hela frontend-koden läsbar — logik, endpoints, ibland kommentarer.",
                 "Publicera inte .map i produktion, eller skicka dem till felrapporteringstjänsten.")
             return
@@ -450,6 +464,7 @@ def js_analysis(base, page):
             "Kör mot den sida som faktiskt laddar applikationens bundles.")
         return
 
+    page["js_bodies"] = [t for _, t in bodies]     # jwt_checks reads tokens from here too
     hits, internal = [], set()
     for name, text in bodies:
         hits += _scan_secrets(text, name)
@@ -527,6 +542,8 @@ def _b64json(seg):
 def jwt_checks(page):
     """A token handed to the browser is a claim about authority — read its header."""
     tokens = set(JWT_RE.findall(page["text"]))
+    for body in page.get("js_bodies", []):
+        tokens |= set(JWT_RE.findall(body))
     for value in EXTRA_HEADERS.values():
         tokens |= set(JWT_RE.findall(value))
     for c in (page["headers"].get_all("set-cookie") or []) if page["headers"] else []:
@@ -534,7 +551,7 @@ def jwt_checks(page):
     if not tokens:
         return
 
-    for tok in list(tokens)[:3]:
+    for tok in list(tokens)[:6]:      # varje token har egna grenar; tre räckte inte
         parts = tok.split(".")
         try:
             head = _b64json(parts[0])
@@ -563,7 +580,8 @@ def jwt_checks(page):
                 if base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == parts[2].rstrip("="):
                     add("jwt-weak-secret", "critical", "tokens",
                         "JWT signerad med en gissningsbar hemlighet",
-                        f"signaturen matchar nyckeln '{secret}' (matematiskt verifierat)",
+                        f"signaturen matchar en nyckel ur en kort gissningslista "
+                        f"('{secret[0]}…{secret[-1]}', {len(secret)} tecken) — matematiskt verifierat",
                         "Alla konton kan kapas genom att signera en egen token.",
                         "Rotera hemligheten till 256 bitars slump och ogiltigför samtliga tokens.")
                     break
@@ -641,7 +659,9 @@ def error_pages(base):
         for pat, label in ERROR_MARKERS:
             m = re.search(pat, text)
             if m:
-                add(f"error-leak-{label.split()[0].lower()}", "medium", "errors",
+                detailed = bool(re.search(r'(File "|at [\w.$]+\(|\.java:\d+|#0\s+/|/var/www|'
+                                          r'/[\w.-]+/[\w.-]+\.(php|py|rb|js):\d+)', text))
+                add(f"error-leak-{label.split()[0].lower()}", "medium" if detailed else "low", "errors",
                     f"Felmeddelandet avslöjar teknik: {label}",
                     _clip(text[max(0, m.start() - 60):m.start() + 140], 220),
                     "Ger exakt ramverk, version och filväg — det som behövs för att välja exploit.",
@@ -710,6 +730,18 @@ def active_auth(base, page):
             fix="Kör med --url mot inloggningssidan om formuläret ligger någon annanstans.")
         return
     action = urllib.parse.urljoin(page["url"], m.group(1) or page["url"])
+    try:
+        same = _origin(action) == TARGET_ORIGIN
+    except ValueError:
+        same = False
+    if not same:
+        add("auth-foreign-action", "medium", "auth",
+            "Inloggningsformuläret postar till ett annat origin",
+            f"action: {action}",
+            "Ett lösenord som skickas till en annan värd lämnar systemet — och en angripare kan "
+            "också styra vart det tar vägen.",
+            "Posta till egen origin; kontrollera action-attributet i mallen.")
+        return
     user_field = "username"
     fm = re.search(r'<input[^>]*name=["\']([^"\']+)["\'][^>]*(?:type=["\'](?:text|email)["\'])', m.group(2), re.I)
     if fm:
@@ -1143,11 +1175,15 @@ def scan(base, domain=None, repo=None, portscan=True, dns=True, delay=0.2):
     if not host:
         add("bad-url", "info", "transport", "Ogiltig URL", base)
         return
-    global TARGET_ORIGIN
-    TARGET_ORIGIN = _origin(base)   # credentials never leave the target origin
+    try:
+        global TARGET_ORIGIN
+        TARGET_ORIGIN = _origin(base)   # credentials never leave the target origin
+    except ValueError:
+        add("bad-url", "info", "transport", "Ogiltig URL (port utanför 0-65535)", base)
+        return
     page = http_checks(base, delay)
     if dest.scheme == "https":
-        tls_checks(host, dest.port or 443)
+        tls_checks(host, TARGET_ORIGIN[2])
     if dns:
         dns_checks(domain or host, delay=min(delay, 0.1))
     if portscan:
@@ -1206,11 +1242,26 @@ def _fixture_jwt():
     return enc({"alg": "none"}) + "." + enc({"sub": "1234567890"}) + "."
 
 
+def _fixture_hs256(secret, kid=None):
+    head = {"alg": "HS256", "typ": "JWT"}
+    if kid:
+        head["kid"] = kid
+    enc = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).rstrip(b"=").decode()
+    unsigned = f"{enc(head)}.{enc({'sub': '1', 'exp': 9999999999})}"
+    sig = base64.urlsafe_b64encode(
+        hmac.new(secret.encode(), unsigned.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
+    return f"{unsigned}.{sig}"
+
+
 def self_test():
     import http.server
     import threading
 
+    global TARGET_ORIGIN, EXTRA_HEADERS
+
     jwt = _fixture_jwt()
+    jwt_weak = _fixture_hs256("secret")
+    jwt_kid = _fixture_hs256("a-real-long-secret-value-123", kid="../../../../etc/passwd")
     fake_aws = "AKIA" + "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -1242,7 +1293,8 @@ def self_test():
                 self.send_header("Content-Type", "application/json")
             elif p == "/app.js":
                 body = (f'var k = "{fake_aws}";  // TODO rotate this before launch\n'
-                        'fetch("http://10.0.0.5/internal/api");\n').encode()
+                        'fetch("http://10.0.0.5/internal/api");\n'
+                        f'var t1 = "{jwt_weak}";\nvar t2 = "{jwt_kid}";\n').encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/javascript")
             elif p == "/crossdomain.xml":
@@ -1327,7 +1379,8 @@ def self_test():
               "no-nosniff", "no-frame-protection", "trace-enabled",
               "js-secrets", "js-todo", "js-internal-hosts", "xdomain-crossdomain.xml",
               "html-comments", "hidden-fields", "noopener-missing", "jwt-alg-none",
-              "jwt-no-exp", "methods-root", "error-leak-python-traceback"}
+              "jwt-no-exp", "jwt-weak-secret", "jwt-kid-injection",
+              "methods-root", "error-leak-python-traceback"}
     problems = []
     got = set(FINDINGS)
     missing = expect - got
@@ -1351,6 +1404,57 @@ def self_test():
         if secret in blob:
             problems.append(f"hemlighet läckte till rapporten ({len(secret)} tecken)")
 
+    # _redact is the only thing standing between a live secret and the report — test it directly
+    sentinel = "pretestsentinelvalue123456"
+    scrubbed = _redact(f"DB_PASSWORD=hunter2 token={sentinel} https://u:p@host/x sid={sentinel}")
+    for leaked in ("hunter2", sentinel, "u:p@"):
+        if leaked in scrubbed:
+            problems.append(f"_redact lämnade kvar {leaked!r}")
+
+    # regression: a 302 must never be followed, so credentials cannot travel with it
+    saved = (TARGET_ORIGIN, dict(EXTRA_HEADERS))
+    catcher = []
+
+    class Bouncer(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{sinkport[0]}/loot")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    class Catcher(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            catcher.append(self.headers.get("Cookie"))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    sinkport = [0]
+    cat = Quiet(("127.0.0.1", 0), Catcher)
+    sinkport[0] = cat.server_address[1]
+    threading.Thread(target=cat.serve_forever, daemon=True).start()
+    bnc = Quiet(("127.0.0.1", 0), Bouncer)
+    threading.Thread(target=bnc.serve_forever, daemon=True).start()
+    try:
+        TARGET_ORIGIN = ("http", "127.0.0.1", bnc.server_address[1])
+        EXTRA_HEADERS.clear()
+        EXTRA_HEADERS["Cookie"] = "session=pretest-fixture-cookie-1234567890"
+        status, _, _ = fetch(f"http://127.0.0.1:{bnc.server_address[1]}/")
+        if status != 302:
+            problems.append(f"redirect följdes (status {status}, förväntade 302)")
+        if catcher:
+            problems.append("en 302 följdes och skickade credentials till annat origin")
+    finally:
+        TARGET_ORIGIN, EXTRA_HEADERS = saved
+        cat.shutdown()
+        bnc.shutdown()
+
     # regression: credentials must never follow a link to another origin (annat port eller värd)
     got_cookie = []
 
@@ -1367,7 +1471,6 @@ def self_test():
         def log_message(self, *a):
             pass
 
-    global TARGET_ORIGIN, EXTRA_HEADERS
     sink = Quiet(("127.0.0.1", 0), Sink)
     threading.Thread(target=sink.serve_forever, daemon=True).start()
     saved = (TARGET_ORIGIN, dict(EXTRA_HEADERS))
